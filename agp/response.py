@@ -283,12 +283,13 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
     text_chunks = []
     tool_calls = []
     finish_hint = None
+    thought_chunks = []
 
     for part in parts or []:
         if not isinstance(part, dict):
             continue
         if "text" in part and part["text"]:
-            text_chunks.append(part["text"])
+            text_chunks.append(part["text"]) and not part.get("thought")
         if "functionCall" in part:
             fc = part["functionCall"] or {}
             name = fc.get("name", "")
@@ -320,14 +321,16 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
             if out:
                 text_chunks.append(f"```\n{out}\n```")
         if "thought" in part and part["thought"]:
-            # Thinking summaries — include as plain text (Gemini sometimes
-            # surfaces these). Keep it; the client can ignore.
-            pass
+            # Thinking summary part ({"thought": true, "text": ...}).
+            # Keep it separate so callers can surface it as
+            # reasoning_content.
+            thought_text = part.get("text") or ""
+            if thought_text:
+                thought_chunks.append(thought_text)
 
     if tool_calls:
         finish_hint = "tool_calls"
-    return "".join(text_chunks), tool_calls, finish_hint
-
+    return "".join(text_chunks), tool_calls, finish_hint, "\n".join(thought_chunks)
 def _finish_reason_from_gemini(candidate: dict, tool_calls: list) -> str:
     """Map Gemini finishReason / stopReason to OpenAI finish_reason."""
     if tool_calls:
@@ -375,12 +378,13 @@ def gemini_response_to_openai(response: dict, model: str) -> dict:
     text = ""
     tool_calls = []
     finish_reason = "stop"
+    reasoning = ""
 
     if candidates:
         cand = candidates[0]
         content = cand.get("content") or {}
         parts = content.get("parts") or []
-        text, tool_calls, _ = _extract_parts(parts)
+        text, tool_calls, _, reasoning = _extract_parts(parts)
         finish_reason = _finish_reason_from_gemini(cand, tool_calls)
         # Assign tool call ids.
         for i, tc in enumerate(tool_calls):
@@ -395,6 +399,10 @@ def gemini_response_to_openai(response: dict, model: str) -> dict:
             text = f"[Content blocked: {br}]"
 
     message = {"role": "assistant", "content": text if text else None}
+    if reasoning:
+        # Surface the thinking chain the way OpenAI-compatible clients expect
+        # (deepseek-style reasoning_content field).
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -419,13 +427,18 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
     """
     text_chunks = []
     tool_call_deltas = []
+    thought_chunks = []
     current_names = set(prev_tool_names)
 
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"]:
+        if "text" in part and part["text"] and not part.get("thought"):
             text_chunks.append(part["text"])
+        if "thought" in part and part["thought"]:
+            t = part.get("text") or ""
+            if t:
+                thought_chunks.append(t)
         if "functionCall" in part:
             fc = part["functionCall"] or {}
             name = fc.get("name", "")
@@ -444,5 +457,4 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
                         "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
                     },
                 })
-
-    return "".join(text_chunks), tool_call_deltas, current_names
+    return "".join(text_chunks), tool_call_deltas, current_names, "\n".join(thought_chunks)

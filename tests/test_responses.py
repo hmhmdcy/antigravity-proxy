@@ -68,15 +68,16 @@ class TestGeminiResponseToOpenAI(unittest.TestCase):
 
 class TestStreamDelta(unittest.TestCase):
     def test_text_delta(self):
-        text, tcs, names = ap._extract_delta_from_parts([{"text": "hel"}], set())
+        text, tcs, names, thought = ap._extract_delta_from_parts([{"text": "hel"}], set())
         self.assertEqual(text, "hel")
         self.assertEqual(tcs, [])
         self.assertEqual(names, set())
+        self.assertEqual(thought, "")
 
     def test_function_call_delta(self):
         parts = [{"functionCall": {"name": "glob", "args": {"path": "x"}, "id": "call_7"},
                   "thoughtSignature": "sig1"}]
-        text, tcs, names = ap._extract_delta_from_parts(parts, set())
+        text, tcs, names, _ = ap._extract_delta_from_parts(parts, set())
         self.assertEqual(tcs[0]["index"], 0)
         self.assertEqual(tcs[0]["id"], "call_call_7|sig1")
         self.assertEqual(tcs[0]["function"]["name"], "glob")
@@ -85,7 +86,7 @@ class TestStreamDelta(unittest.TestCase):
     def test_second_tool_gets_next_index(self):
         parts = [{"functionCall": {"name": "glob", "args": {}, "id": "call_1"}},
                  {"functionCall": {"name": "read", "args": {}, "id": "call_2"}}]
-        _, tcs, _ = ap._extract_delta_from_parts(parts, set())
+        _, tcs, _, _ = ap._extract_delta_from_parts(parts, set())
         self.assertEqual([t["index"] for t in tcs], [0, 1])
 
 

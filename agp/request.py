@@ -396,14 +396,14 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         gen_config["maxOutputTokens"] = _client_max + _think_budget
         gen_config.setdefault("thinkingConfig", {})
         gen_config["thinkingConfig"].setdefault("thinkingBudget", _think_budget)
-        gen_config["thinkingConfig"].setdefault("includeThoughts", False)
+        gen_config["thinkingConfig"].setdefault("includeThoughts", True)
     elif "max_completion_tokens" in body and body["max_completion_tokens"] is not None:
         _client_max = int(body["max_completion_tokens"])
         _think_budget = min(max(_client_max, 256), 8192)
         gen_config["maxOutputTokens"] = _client_max + _think_budget
         gen_config.setdefault("thinkingConfig", {})
         gen_config["thinkingConfig"].setdefault("thinkingBudget", _think_budget)
-        gen_config["thinkingConfig"].setdefault("includeThoughts", False)
+        gen_config["thinkingConfig"].setdefault("includeThoughts", True)
     # NOTE: frequency_penalty / presence_penalty are intentionally dropped.
     # Gemini's sandbox backend rejects them with 400 "Penalty is not enabled
     # for this model"; OpenAI clients send them by default on some paths.
@@ -417,7 +417,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
     # Enable thinking for the thinking variant of claude-opus.
     if backend_model == "claude-opus-4-6-thinking":
         thinking_cfg = gen_config.get("thinkingConfig", {})
-        thinking_cfg.setdefault("includeThoughts", False)
+        thinking_cfg.setdefault("includeThoughts", True)
         gen_config["thinkingConfig"] = thinking_cfg
     # OpenAI response_format -> Gemini responseMimeType / responseSchema.
     rf = body.get("response_format") or {}
@@ -438,8 +438,24 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
     if thinking_level:
         thinking_cfg = gen_config.get("thinkingConfig", {})
         thinking_cfg.setdefault("thinkingLevel", thinking_level)
-        thinking_cfg.setdefault("includeThoughts", False)
+        thinking_cfg.setdefault("includeThoughts", True)
         gen_config["thinkingConfig"] = thinking_cfg
+    else:
+        # Tier-suffixed backend names (gemini-3.7-flash-high etc.) imply
+        # thinking is enabled at the model tier; ask for the thought parts
+        # explicitly so we can surface them as reasoning_content.
+        for _suf in ("-high", "-low", "-medium", "-tiered"):
+            if backend_model.endswith(_suf):
+                thinking_cfg = gen_config.get("thinkingConfig", {})
+                thinking_cfg.setdefault("includeThoughts", True)
+                if _suf == "-high":
+                    thinking_cfg.setdefault("thinkingLevel", "high")
+                elif _suf == "-medium":
+                    thinking_cfg.setdefault("thinkingLevel", "medium")
+                elif _suf == "-low":
+                    thinking_cfg.setdefault("thinkingLevel", "low")
+                gen_config["thinkingConfig"] = thinking_cfg
+                break
     if gen_config:
         inner["generationConfig"] = gen_config
 

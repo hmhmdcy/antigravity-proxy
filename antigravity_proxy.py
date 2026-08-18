@@ -480,7 +480,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 cand = cands[0]
                 parts = ((cand.get("content") or {}).get("parts")) or []
 
-                text_delta, tool_call_deltas, seen_tool_names = _extract_delta_from_parts(
+                text_delta, tool_call_deltas, seen_tool_names, thought_delta = _extract_delta_from_parts(
                     parts, seen_tool_names
                 )
                 fr = cand.get("finishReason")
@@ -735,7 +735,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 content = cand.get("content") or {}
                 parts = content.get("parts") or []
 
-                text_delta, tool_call_deltas, seen_tool_names = _extract_delta_from_parts(
+                text_delta, tool_call_deltas, seen_tool_names, thought_delta = _extract_delta_from_parts(
                     parts, seen_tool_names
                 )
 
@@ -764,6 +764,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 delta = {}
                 if text_delta:
                     delta["content"] = text_delta
+                if thought_delta:
+                    # Thinking chain -> deepseek-style reasoning_content so
+                    # clients display it as a thinking block.
+                    delta["reasoning_content"] = thought_delta
                 if tool_call_deltas:
                     delta["tool_calls"] = tool_call_deltas
 
