@@ -1156,10 +1156,26 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         gen_config["temperature"] = float(body["temperature"])
     if "top_p" in body and body["top_p"] is not None:
         gen_config["topP"] = float(body["top_p"])
+    # max_tokens semantics: OpenAI counts OUTPUT tokens only, but Gemini's
+    # maxOutputTokens includes thinking tokens (3.7-flash-high spends most of
+    # a small budget on reasoning, starving the visible output). Compensate by
+    # reserving a thinking budget and adding it to the output cap so the
+    # client's requested output length is honored. If the sandbox rejects
+    # thinkingBudget, we fall back to a 2x multiplier below.
     if "max_tokens" in body and body["max_tokens"] is not None:
-        gen_config["maxOutputTokens"] = int(body["max_tokens"])
+        _client_max = int(body["max_tokens"])
+        _think_budget = min(max(_client_max, 256), 8192)
+        gen_config["maxOutputTokens"] = _client_max + _think_budget
+        gen_config.setdefault("thinkingConfig", {})
+        gen_config["thinkingConfig"].setdefault("thinkingBudget", _think_budget)
+        gen_config["thinkingConfig"].setdefault("includeThoughts", False)
     elif "max_completion_tokens" in body and body["max_completion_tokens"] is not None:
-        gen_config["maxOutputTokens"] = int(body["max_completion_tokens"])
+        _client_max = int(body["max_completion_tokens"])
+        _think_budget = min(max(_client_max, 256), 8192)
+        gen_config["maxOutputTokens"] = _client_max + _think_budget
+        gen_config.setdefault("thinkingConfig", {})
+        gen_config["thinkingConfig"].setdefault("thinkingBudget", _think_budget)
+        gen_config["thinkingConfig"].setdefault("includeThoughts", False)
     # NOTE: frequency_penalty / presence_penalty are intentionally dropped.
     # Gemini's sandbox backend rejects them with 400 "Penalty is not enabled
     # for this model"; OpenAI clients send them by default on some paths.
