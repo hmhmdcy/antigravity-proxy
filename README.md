@@ -384,6 +384,65 @@ MODEL_MAP = {
 ```
 
 Restart the proxy after editing.
+## Customization Notes (this fork)
+
+This fork adds production hardening and OpenAI-compatibility fixes on top of
+the upstream proxy. Behavior deltas vs upstream:
+
+### Authentication
+Requests require a bearer token matching the `AG_TOKEN` env var, or
+`X-Goog-Api-Key` with the same value. Upstream has **no auth layer** — anyone
+who can reach the port can burn your Antigravity quota. Run with:
+
+```bash
+AG_TOKEN=sk-your-secret python3 antigravity_proxy.py --host 0.0.0.0 --port 8877
+```
+
+### OpenAI compatibility fixes (all verified against the sandbox backend)
+- **Tool round-trip**: OpenAI `role:"tool"` messages are converted to Gemini
+  `role:"user"` + `functionResponse` (Gemini rejects `role:"function"`), and
+  a `tool_call_id -> function name` registry restores the name that OpenAI
+  tool messages omit (Gemini requires `functionResponse.name` to match the
+  original `functionCall.name`).
+- **Schema sanitizer** (`_sanitize_gemini_schema`): rewrites JSON Schema into
+  the Gemini-proto subset. `type:["x","null"]` -> `type`+`nullable`;
+  `additionalProperties:false` is kept (accepted by the sandbox); rejected
+  keywords (`exclusiveMinimum`, `multipleOf`, `$ref`, `patternProperties`,
+  `$schema`) are folded into the `description` as `[Constraint: ...]` so the
+  model still honors them instead of silently dropping the constraint.
+- **Penalties dropped**: `frequency_penalty` / `presence_penalty` are ignored
+  — Gemini 3 sandbox rejects them with 400 ("Penalty is not enabled").
+- **`response_format`**: `json_object` -> `responseMimeType`; `json_schema`
+  -> `responseSchema` (sanitized).
+- **Images**: `image_url` data URLs -> `inlineData` parts (real vision input,
+  not a text placeholder).
+- **`max_tokens` semantics**: Gemini's `maxOutputTokens` includes thinking
+  tokens, so a small client `max_tokens` can starve the visible output. The
+  proxy reserves a `thinkingBudget` (clamped 256..8192) and adds it to the
+  output cap, so the client's requested output length is honored.
+
+### Extra endpoints
+- **`POST /v1/responses`** — OpenAI Responses API bridge (SSE state machine,
+  `function_call` / `function_call_output` round-trips).
+- **Streaming errors** are emitted as structured SSE `{"error": {...}}` events
+  followed by `[DONE]`, not as `[Error: ...]` text inside `content`.
+
+### Testing
+```bash
+# offline unit tests (no network/token needed)
+python3 -m unittest discover -s tests -v
+
+# full suite incl. live proxy checks (skipped without PROXY_KEY)
+PROXY_URL=http://127.0.0.1:8877 PROXY_KEY=sk-... \
+  python3 -m unittest discover -s tests -v
+```
+
+### Known limitations
+- `response_format` json_schema with `$ref` is not resolved — refs are folded
+  into the description, so strict output may not match when schemas rely on
+  shared definitions.
+- The proxy is single-file (~2600 lines); keep changes focused.
+
 
 ---
 

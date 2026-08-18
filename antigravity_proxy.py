@@ -1766,6 +1766,17 @@ def _openai_error(message: str, err_type: str = "api_error", code=None, status: 
     }
 
 
+def _stream_error_payload(message: str, err_type: str = "api_error", code=None, status: int = 500):
+    """Build an OpenAI-style SSE error event payload.
+
+    The non-streaming error body is
+        {"error": {"message": ..., "type": ..., "param": null, "code": ...}}
+    and per the SSE convention the event payload carries the same shape
+    (the event name may also be "error"; clients key on the payload).
+    """
+    return _openai_error(message, err_type, code, status)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP handler
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2369,18 +2380,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     return
                 except Exception:
                     pass  # fall through to error chunk
-            err_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"[Error: {e}]"},
-                    "finish_reason": "stop",
-                }],
-            }
-            send_sse(err_chunk)
+            send_sse(_stream_error_payload(str(e), err_type="upstream_error",
+                                         code=e.status if hasattr(e, "status") else 500))
             send_sse({"__done__": True})  # sentinel handled below
             try:
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -2389,18 +2390,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
             return
         except Exception as e:
-            err_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"[Error: {e}]"},
-                    "finish_reason": "stop",
-                }],
-            }
-            send_sse(err_chunk)
+            _log(f"Streaming error: {e}")
+            send_sse(_stream_error_payload(str(e), err_type="upstream_error"))
             try:
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -2556,20 +2547,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     return
                 except Exception:
                     pass  # fall through to error chunk
-            # Try to send an error chunk then close.
+            # Send a structured SSE error event, then close the stream.
             try:
-                err_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": openai_model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": f"\n[stream error: {e}]"},
-                        "finish_reason": "stop",
-                    }],
-                }
-                send_sse(err_chunk)
+                send_sse(_stream_error_payload(str(e), err_type="upstream_error",
+                                               code=e.status if hasattr(e, "status") else 500))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except Exception:
