@@ -13,3 +13,6 @@ build/
 *.swp
 *.swo
 *~
+# VPS customization backups
+*.bak*
+*.bak-*

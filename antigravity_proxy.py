@@ -60,16 +60,12 @@ CLIENT_SECRET = os.environ.get(
 
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-CLOUDCODE_BASE = "https://cloudcode-pa.googleapis.com"
+CLOUDCODE_BASE = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 
-ANTIGRAVITY_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Antigravity/1.0.14 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
-)
+ANTIGRAVITY_USER_AGENT = "antigravity/2.8.1 windows/amd64"
 CLIENT_METADATA = json.dumps(
     {"ideType": "ANTIGRAVITY", "platform": "MACOS", "pluginType": "GEMINI"},
     separators=(",", ":"),
@@ -82,6 +78,11 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
+# The sandbox backend intermittently rejects requests with
+# "User location is not supported" (FAILED_PRECONDITION); retry absorbs the
+# transient window since the same request succeeds seconds later.
+_LOCATION_RETRIES = 3
+_LOCATION_RETRY_DELAY = 1.0
 
 # Model mapping: OpenAI-facing name -> Antigravity backend model name.
 # Tested against cloudcode-pa.googleapis.com on 2026-06-30.
@@ -97,9 +98,11 @@ MODEL_MAP = {
     "gemini-2.5-flash": ("gemini-2.5-flash", None),
     "claude-sonnet-4.6": ("claude-sonnet-4-6", None),
     "claude-opus-4.6": ("claude-opus-4-6-thinking", None),
+    "gemini-3.6-flash": ("gemini-3.6-flash-high", None),
+    "gemini-3.7-flash": ("gemini-3.7-flash-high", None),
 }
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -375,6 +378,51 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+_GEMINI_SCHEMA_ALLOWED = {
+    "type", "nullable", "enum", "description", "format", "items",
+    "properties", "required", "minItems", "maxItems", "minLength",
+    "maxLength", "pattern", "minimum", "maximum", "minProperties",
+    "maxProperties", "default",
+}
+
+def _sanitize_gemini_schema(schema):
+    """Rewrite an OpenAI-style JSON Schema into the subset Gemini's function
+    calling accepts. OpenAI-format clients send full JSON Schema (e.g.
+    `exclusiveMinimum`, `type: ["string","null"]`); Gemini's proto rejects
+    unknown fields, so strip/rewrite them recursively.
+
+    Allowed keys follow the Gemini function-declaration schema subset.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, list):
+            # ["string","null"] -> type "string" + nullable true
+            non_null = [t for t in value if t != "null"]
+            if non_null:
+                out["type"] = non_null[0]
+            else:
+                out["type"] = "string"
+            if "null" in value:
+                out["nullable"] = True
+        elif key == "enum" and isinstance(value, list):
+            if any(v is None for v in value):
+                out["nullable"] = True
+                value = [v for v in value if v is not None]
+            if value:
+                out["enum"] = value
+        elif key == "items" and isinstance(value, dict):
+            out["items"] = _sanitize_gemini_schema(value)
+        elif key == "properties" and isinstance(value, dict):
+            out["properties"] = {k: _sanitize_gemini_schema(v) for k, v in value.items()}
+        elif key in _GEMINI_SCHEMA_ALLOWED:
+            out[key] = value
+        # Everything else (exclusiveMinimum/exclusiveMaximum/additionalProperties/
+        # $schema/$ref/patternProperties/... ) is dropped.
+    return out
+
+
 def _openai_tools_to_gemini(tools: list) -> list:
     """Convert OpenAI tools array to Gemini functionDeclarations format.
 
@@ -399,11 +447,412 @@ def _openai_tools_to_gemini(tools: list) -> list:
         }
         params = func.get("parameters")
         if isinstance(params, dict) and params:
-            decl["parameters"] = params
+            decl["parameters"] = _sanitize_gemini_schema(params)
         decls.append(decl)
     if not decls:
         return []
     return [{"functionDeclarations": decls}]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI Responses API bridge (/v1/responses)
+# Converts Responses requests to chat-completion messages for the existing
+# Gemini pipeline, and converts Gemini responses/streams back to Responses
+# output items / SSE events. Reference: LiteLLM completion-transformation.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _normalize_responses_content(content):
+    """Responses message content (str or list of parts) -> chat content string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            pt = part.get("type")
+            if pt in ("input_text", "output_text", "text"):
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    texts.append(txt)
+        return "".join(texts)
+    return ""
+
+
+def _responses_input_to_messages(body: dict) -> list:
+    """Responses API ``input`` + ``instructions`` -> chat messages.
+
+    Handles string input, message items (developer/system/user/assistant),
+    function_call items and function_call_output items. Consecutive
+    function_call items are merged into one assistant message so the Gemini
+    tool round-trip stays consistent.
+    """
+    messages = []
+    instructions = body.get("instructions")
+    if instructions:
+        messages.append({"role": "system", "content": _normalize_responses_content(instructions)})
+
+    inp = body.get("input", "")
+    tool_names_by_call_id = {}
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for item in inp:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t in ("function_call_output", "custom_tool_call_output", "tool_result",
+                     "web_search_call", "computer_call_output"):
+                cid = item.get("call_id")
+                if not cid:
+                    continue
+                out = item.get("output", "")
+                if isinstance(out, list):
+                    out = _normalize_responses_content(out)
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": str(cid),
+                    "content": "" if out is None else str(out),
+                }
+                # Gemini requires functionResponse.name to match the original
+                # functionCall.name; the Responses function_call_output item only
+                # carries call_id, so recover the name from a preceding
+                # function_call item in the same input.
+                fn_name = tool_names_by_call_id.get(str(cid))
+                if fn_name:
+                    tool_msg["name"] = fn_name
+                messages.append(tool_msg)
+            elif t in ("function_call", "custom_tool_call"):
+                cid = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+                fn_name = str(item.get("name") or "")
+                tool_names_by_call_id[str(cid)] = fn_name
+                args = item.get("arguments") or {}
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                new_msg = {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": str(cid),
+                        "type": "function",
+                        "function": {
+                            "name": str(item.get("name") or ""),
+                            "arguments": args,
+                        },
+                    }],
+                }
+                # Merge consecutive function_call items into the previous assistant message.
+                if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
+                    messages[-1]["tool_calls"].extend(new_msg["tool_calls"])
+                else:
+                    messages.append(new_msg)
+            else:
+                # message item
+                role = item.get("role") or "user"
+                if role == "developer":
+                    role = "system"
+                content = item.get("content")
+                if content is None:
+                    continue
+                messages.append({"role": role, "content": _normalize_responses_content(content)})
+    return messages
+
+
+def _responses_tools_to_chat_tools(tools) -> list:
+    """Responses tools -> chat tools. Only ``function`` tools are kept;
+    server-hosted built-ins (web_search, code_interpreter, computer_use,
+    file_search, ...) have no Gemini equivalent and are dropped."""
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            continue
+        params = tool.get("parameters") or {}
+        if not isinstance(params, dict) or "type" not in params:
+            params = {"type": "object"}
+        fn = {
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "parameters": params,
+        }
+        if tool.get("strict") is not None:
+            fn["strict"] = tool["strict"]
+        out.append({"type": "function", "function": fn})
+    return out
+
+
+def _gemini_usage_to_responses_usage(gemini_resp: dict) -> dict:
+    um = (gemini_resp or {}).get("usageMetadata") or {}
+    return {
+        "input_tokens": um.get("promptTokenCount", 0),
+        "output_tokens": um.get("candidatesTokenCount", 0),
+        "total_tokens": um.get("totalTokenCount", 0),
+    }
+
+
+_FINISH_TO_RESPONSES_STATUS = {
+    "STOP": "completed",
+    "MAX_TOKENS": "incomplete",
+    "SAFETY": "incomplete",
+    "RECITATION": "incomplete",
+    "BLOCKLIST": "incomplete",
+    "PROHIBITED_CONTENT": "incomplete",
+    "SPII": "incomplete",
+    "IMAGE_SAFETY": "incomplete",
+    "LANGUAGE": "incomplete",
+    "OTHER": "completed",
+}
+
+
+def _gemini_to_responses_output(gemini_resp: dict, model: str) -> tuple[list, str]:
+    """Gemini response -> (responses output items, status)."""
+    output = []
+    cands = (gemini_resp or {}).get("candidates") or []
+    if not cands:
+        return output, "incomplete"
+    cand = cands[0]
+    parts = ((cand.get("content") or {}).get("parts")) or []
+
+    text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+    text = "".join(text_parts)
+
+    fcalls = [p.get("functionCall") for p in parts if isinstance(p, dict) and p.get("functionCall")]
+
+    if text:
+        output.append({
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        })
+    for fc in fcalls:
+        if not isinstance(fc, dict):
+            continue
+        call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        args = fc.get("args") or {}
+        output.append({
+            "id": f"fc_{uuid.uuid4().hex[:12]}",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": str(call_id),
+            "name": str(fc.get("name") or ""),
+            "arguments": args if isinstance(args, str) else json.dumps(args),
+        })
+
+    fr = (cand.get("finishReason") or "STOP").upper()
+    status = _FINISH_TO_RESPONSES_STATUS.get(fr, "completed")
+    return output, status
+
+
+class _ResponsesStreamState:
+    """State machine emitting OpenAI Responses SSE events from Gemini stream
+    events. Event order follows the Responses API spec:
+    response.created -> response.in_progress -> output_item.added
+    -> content_part.added -> output_text.delta* -> output_text.done
+    -> content_part.done -> output_item.done -> response.completed.
+    Tool calls: output_item.added(function_call) -> function_call_arguments.delta*.
+    """
+
+    def __init__(self, resp_id: str, created: int, model: str):
+        self.resp_id = resp_id
+        self.created = created
+        self.model = model
+        self.sent_created = False
+        self.sent_in_progress = False
+        self.sent_msg_item = False
+        self.sent_msg_part = False
+        self.sent_text_done = False
+        self.msg_item_id = None
+        self.text_buf = []
+        self.tool_items = {}  # index -> item id
+        self.tool_buf = {}    # index -> [name, call_id, args_str]
+        self.finished = False
+
+    def _base_response(self, status="in_progress"):
+        return {
+            "id": self.resp_id,
+            "object": "response",
+            "created_at": self.created,
+            "status": status,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "metadata": {},
+            "model": self.model,
+            "output": [],
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": None,
+            "temperature": None,
+            "text": {},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": None,
+            "truncation": None,
+            "usage": None,
+            "user": None,
+        }
+
+    def initial_events(self) -> list:
+        evts = []
+        if not self.sent_created:
+            self.sent_created = True
+            evts.append({"type": "response.created", "response": self._base_response("in_progress")})
+        if not self.sent_in_progress:
+            self.sent_in_progress = True
+            evts.append({"type": "response.in_progress", "response": self._base_response("in_progress")})
+        return evts
+
+    def _ensure_msg_item(self, evts: list):
+        if self.sent_msg_item:
+            return
+        self.sent_msg_item = True
+        self.msg_item_id = f"msg_{uuid.uuid4().hex[:12]}"
+        evts.append({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": self.msg_item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        })
+        if not self.sent_msg_part:
+            self.sent_msg_part = True
+            evts.append({
+                "type": "response.content_part.added",
+                "item_id": self.msg_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            })
+
+    def on_text_delta(self, text: str) -> list:
+        evts = self.initial_events()
+        self._ensure_msg_item(evts)
+        self.text_buf.append(text)
+        evts.append({
+            "type": "response.output_text.delta",
+            "item_id": self.msg_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        })
+        return evts
+
+    def on_tool_call(self, index: int, call_id: str, name: str, args: str) -> list:
+        evts = self.initial_events()
+        if index in self.tool_items:
+            # Gemini emits the full functionCall in one event; later duplicate
+            # emissions (same name+args) are idempotent no-ops.
+            if self.tool_buf[index][0] == name and self.tool_buf[index][2] == args:
+                return []
+            self.tool_buf[index][0] = name or self.tool_buf[index][0]
+            self.tool_buf[index][1] = call_id or self.tool_buf[index][1]
+            self.tool_buf[index][2] += args
+        else:
+            self.tool_items[index] = f"fc_{uuid.uuid4().hex[:12]}"
+            self.tool_buf[index] = [name, call_id, args]
+            evts.append({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": self.tool_items[index],
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                },
+            })
+        item_id = self.tool_items[index]
+        # Split into small deltas to mimic OpenAI's token-by-token behaviour.
+        for i in range(0, len(args), 10):
+            evts.append({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": 0,
+                "delta": args[i:i + 10],
+            })
+        return evts
+
+    def finish(self, finish_reason: str, usage: dict) -> list:
+        evts = self.initial_events()
+        # Close message item if we opened one.
+        if self.sent_msg_item and not self.sent_text_done:
+            self.sent_text_done = True
+            text = "".join(self.text_buf)
+            evts.append({
+                "type": "response.output_text.done",
+                "item_id": self.msg_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": text,
+            })
+            evts.append({
+                "type": "response.content_part.done",
+                "item_id": self.msg_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            })
+            evts.append({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": self.msg_item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                },
+            })
+        # Close tool call items.
+        for index in sorted(self.tool_items):
+            item_id = self.tool_items[index]
+            name, call_id, args = self.tool_buf[index]
+            evts.append({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": args,
+                },
+            })
+        status = _FINISH_TO_RESPONSES_STATUS.get((finish_reason or "STOP").upper(), "completed")
+        final_resp = self._base_response(status)
+        final_resp["usage"] = usage or None
+        # Rebuild output[] from what we emitted.
+        final_resp["output"] = []
+        if self.sent_msg_item:
+            final_resp["output"].append({
+                "id": self.msg_item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "".join(self.text_buf), "annotations": []}],
+            })
+        for index in sorted(self.tool_items):
+            name, call_id, args = self.tool_buf[index]
+            final_resp["output"].append({
+                "id": self.tool_items[index],
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": args,
+            })
+        evts.append({"type": "response.completed", "response": final_resp})
+        self.finished = True
+        return evts
 
 
 def _tool_choice_to_gemini(tool_choice) -> str | None:
@@ -432,6 +881,11 @@ def _tool_choice_to_gemini(tool_choice) -> str | None:
 # Matches /v1beta/models/{model}:generateContent
 _GEMINI_PASSTHROUGH_RE = re.compile(
     r"^/v1beta/models/(.+):generateContent$"
+)
+
+# Matches /v1beta/models/{model}:streamGenerateContent
+_GEMINI_STREAM_PASSTHROUGH_RE = re.compile(
+    r"^/v1beta/models/(.+):streamGenerateContent$"
 )
 
 
@@ -494,6 +948,11 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
 
     system_texts = []
     contents = []
+    # Registry: OpenAI tool_call_id -> real function name, populated from
+    # assistant tool_calls so Gemini functionResponse.name can match the
+    # original functionCall.name (Gemini requires the match; OpenAI tool
+    # messages carry no name field).
+    name_by_call_id = {}
 
     # Collect system instruction pieces and convert messages.
     for msg in messages:
@@ -517,8 +976,11 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                     response_obj = parsed if isinstance(parsed, dict) else {"result": parsed}
                 except (json.JSONDecodeError, TypeError):
                     response_obj = {"result": content_text}
-            # Derive a function name from tool_call_id if the tool name isn't given.
-            fn_name = msg.get("name") or tool_call_id or "tool_result"
+            # Derive a function name: prefer the message name, else the
+            # registry populated from prior assistant tool_calls (OpenAI tool
+            # messages omit name), else tool_call_id as last resort.
+            fn_name = (msg.get("name") or name_by_call_id.get(tool_call_id)
+                       or tool_call_id or "tool_result")
             # Decode the fc_id from the encoded tool_call_id (format: call_<fc_id>|<sig>).
             fc_response_id = ""
             if tool_call_id.startswith("call_"):
@@ -534,7 +996,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             if fc_response_id:
                 func_resp["id"] = fc_response_id
             contents.append({
-                "role": "function",
+                "role": "user",
                 "parts": [{"functionResponse": func_resp}],
             })
             continue
@@ -559,6 +1021,8 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                     args = {"raw": str(args_str)}
                 if fn_name:
                     tc_id = tc.get("id", "") or ""
+                    if tc_id:
+                        name_by_call_id[tc_id] = fn_name
                     fc_id = ""
                     thought_sig = ""
                     # Decode: format is call_<fc_id>|<thought_signature>
@@ -903,41 +1367,51 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     return req
 
 
+def _is_location_error(e) -> bool:
+    body = getattr(e, "body", "") or ""
+    return "location is not supported" in body.lower()
+
+
 def call_generate_content(envelope: dict) -> dict:
-    """Non-streaming call. Returns the unwrapped inner Gemini response dict."""
-    req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
-    try:
-        with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
-            raw = resp.read().decode()
-    except HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()
-        except Exception:
-            pass
-        raise UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
-    except URLError as e:
-        raise UpstreamError(f"Upstream network error: {e}", status=502)
+    """Non-streaming call. Returns the unwrapped inner Gemini response dict.
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        raise UpstreamError(f"Upstream returned non-JSON: {raw[:500]}", status=502)
-
-    # Unwrap the envelope: {"response": {<gemini>}} or sometimes bare.
-    if isinstance(payload, dict) and "response" in payload:
-        return payload["response"]
-    return payload
-
-
-def stream_generate_content(envelope: dict):
-    """Streaming call. Yields parsed JSON event objects from the SSE stream.
-
-    The Antigravity stream endpoint returns either:
-      - SSE format: lines "data: {json}\n\n"
-      - Or a bare JSON array of incremental response objects (some endpoints).
-    We handle both.
+    Retries transient "User location is not supported" rejections.
     """
+    last_exc = None
+    for attempt in range(_LOCATION_RETRIES + 1):
+        req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
+        try:
+            with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
+                raw = resp.read().decode()
+        except HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode()
+            except Exception:
+                pass
+            last_exc = UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
+            if _is_location_error(last_exc) and attempt < _LOCATION_RETRIES:
+                _log(f"location-limited upstream error, retrying ({attempt + 1}/{_LOCATION_RETRIES})...")
+                time.sleep(_LOCATION_RETRY_DELAY * (attempt + 1))
+                continue
+            raise last_exc
+        except URLError as e:
+            raise UpstreamError(f"Upstream network error: {e}", status=502)
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            raise UpstreamError(f"Upstream returned non-JSON: {raw[:500]}", status=502)
+
+        # Unwrap the envelope: {"response": {<gemini>}} or sometimes bare.
+        if isinstance(payload, dict) and "response" in payload:
+            return payload["response"]
+        return payload
+    raise last_exc  # pragma: no cover - loop always returns or raises
+
+
+def _stream_once(envelope: dict):
+    """Single streaming attempt; yields parsed SSE event objects."""
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
         resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
@@ -980,6 +1454,30 @@ def stream_generate_content(envelope: dict):
                     yield obj
     finally:
         resp.close()
+
+
+def stream_generate_content(envelope: dict):
+    """Streaming call. Yields parsed JSON event objects from the SSE stream.
+
+    Retries transient "User location is not supported" rejections; only the
+    connection/HTTP stage is retried (before any event has been yielded).
+
+    The Antigravity stream endpoint returns either:
+      - SSE format: lines "data: {json}\n\n"
+      - Or a bare JSON array of incremental response objects (some endpoints).
+    We handle both.
+    """
+    attempt = 0
+    while True:
+        try:
+            yield from _stream_once(envelope)
+            return
+        except UpstreamError as e:
+            if not _is_location_error(e) or attempt >= _LOCATION_RETRIES:
+                raise
+            attempt += 1
+            _log(f"location-limited stream error, retrying ({attempt}/{_LOCATION_RETRIES})...")
+            time.sleep(_LOCATION_RETRY_DELAY * attempt)
 
 
 def _try_parse_one_event(buffer: str):
@@ -1167,6 +1665,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "AntigravityProxy/2.0"
 
+    def _check_auth(self) -> bool:
+        expected = os.environ.get("AG_TOKEN", "").strip()
+        if not expected:
+            return True
+        hdr = self.headers.get("Authorization", "")
+        xgk = self.headers.get("X-Goog-Api-Key", "")
+        if hdr == f"Bearer {expected}" or xgk == expected:
+            return True
+        self._send_json(401, _openai_error("Invalid API key", err_type="authentication_error", code=401))
+        return False
+
     def log_message(self, fmt, *args):
         # We do our own logging.
         pass
@@ -1200,6 +1709,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ── GET routes ────────────────────────────────────────────────────────────
 
     def do_GET(self):
+        if not self._check_auth():
+            return
         t0 = time.time()
         path = urlparse(self.path).path
         try:
@@ -1235,14 +1746,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ── POST routes ───────────────────────────────────────────────────────────
 
     def do_POST(self):
+        if not self._check_auth():
+            return
         t0 = time.time()
         path = urlparse(self.path).path
         try:
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat()
                 self._log_req("POST", path, 200, time.time() - t0)
+            elif path in ("/v1/responses", "/responses"):
+                self._handle_responses()
+                self._log_req("POST", path, 200, time.time() - t0)
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
+                self._log_req("POST", path, 200, time.time() - t0)
+            elif _GEMINI_STREAM_PASSTHROUGH_RE.match(path):
+                self._handle_gemini_stream_passthrough(path)
                 self._log_req("POST", path, 200, time.time() - t0)
             else:
                 self._send_error_json("not_found", "Not found", err_type="invalid_request_error", http_code=404)
@@ -1295,6 +1814,281 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, gemini_resp)
 
+    def _handle_gemini_stream_passthrough(self, path: str):
+        """Handle a native Gemini streamGenerateContent request.
+
+        Same passthrough envelope as the non-streaming variant; the Antigravity
+        SSE stream is re-serialized back to the caller as SSE events. This lets
+        Gemini-native SDKs/clients (e.g. omp's google-generative-ai protocol)
+        stream through the OAuth-funded proxy.
+        """
+        body = self._read_body()
+        if body is None or not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Invalid JSON body", err_type="invalid_request_error", http_code=400)
+            return
+
+        model = _GEMINI_STREAM_PASSTHROUGH_RE.match(path).group(1)
+
+        try:
+            envelope = _build_passthrough_envelope(model, body)
+        except UpstreamError as e:
+            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
+            return
+        except RuntimeError as e:
+            self._send_error_json("auth_error", str(e), err_type="authentication_error", http_code=401)
+            return
+        except Exception as e:
+            self._send_error_json("request_error", f"Failed to build request: {e}", err_type="invalid_request_error", http_code=400)
+            return
+
+        # Send SSE headers.
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception:
+            return
+
+        try:
+            for event in stream_generate_content(envelope):
+                if event is None:
+                    continue
+                try:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        except UpstreamError as e:
+            _log(f"gemini stream passthrough upstream error: {e.status} {e.body}")
+            try:
+                err = {"error": {"code": e.status, "message": e.body or str(e), "status": "UPSTREAM_ERROR"}}
+                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                self.wfile.flush()
+            except Exception:
+                pass
+        except Exception as e:
+            _log(f"gemini stream passthrough error: {e}\n{traceback.format_exc()}")
+
+    # ── Responses API (/v1/responses) ─────────────────────────────────────────
+
+    def _handle_responses(self):
+        body = self._read_body()
+        if body is None:
+            self._send_error_json("invalid_request", "Invalid JSON body", err_type="invalid_request_error", http_code=400)
+            return
+        if not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Request body must be a JSON object", err_type="invalid_request_error", http_code=400)
+            return
+
+        openai_model = body.get("model") or DEFAULT_MODEL
+        stream = bool(body.get("stream", False))
+
+        model_entry = MODEL_MAP.get(openai_model)
+        if model_entry:
+            backend_model, thinking_level = model_entry
+        else:
+            backend_model = openai_model
+            thinking_level = None
+        # NOTE: `reasoning.effort` is intentionally ignored. Mapping it to the
+        # "-low/-medium/-high" backend tier suffix produces 404s because those
+        # tier models do not exist on the Antigravity backend.
+
+        messages = _responses_input_to_messages(body)
+        tools = _responses_tools_to_chat_tools(body.get("tools"))
+        chat_body = {
+            "model": openai_model,
+            "messages": messages,
+            "tools": tools,
+            "stream": stream,
+        }
+        if body.get("max_output_tokens") is not None:
+            chat_body["max_tokens"] = body["max_output_tokens"]
+        if body.get("temperature") is not None:
+            chat_body["temperature"] = body["temperature"]
+        if body.get("top_p") is not None:
+            chat_body["top_p"] = body["top_p"]
+
+        try:
+            envelope = _build_gemini_request(chat_body, backend_model, thinking_level)
+        except Exception as e:
+            self._send_error_json("request_error", f"Failed to build request: {e}", err_type="invalid_request_error", http_code=400)
+            return
+
+        if stream:
+            self._handle_responses_stream(envelope, openai_model)
+        else:
+            self._handle_responses_nonstream(envelope, openai_model)
+
+    def _handle_responses_nonstream(self, envelope, openai_model):
+        try:
+            gemini_resp = call_generate_content(envelope)
+        except UpstreamError as e:
+            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
+            return
+        except Exception as e:
+            self._send_error_json("upstream_error", f"Upstream call failed: {e}", err_type="api_error", http_code=502)
+            return
+
+        try:
+            output, status = _gemini_to_responses_output(gemini_resp, openai_model)
+        except Exception as e:
+            _log(f"Responses transform error: {e}\n{traceback.format_exc()}")
+            output, status = [], "incomplete"
+
+        resp = {
+            "id": f"resp_{uuid.uuid4().hex[:24]}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": status,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "metadata": {},
+            "model": openai_model,
+            "output": output,
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": None,
+            "temperature": None,
+            "text": {},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": None,
+            "truncation": None,
+            "usage": _gemini_usage_to_responses_usage(gemini_resp),
+            "user": None,
+            "max_output_tokens": None,
+        }
+        self._send_json(200, resp)
+
+    def _handle_responses_stream(self, envelope, openai_model):
+        resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception:
+            return
+
+        def send_event(evt):
+            try:
+                self.wfile.write(f"data: {json.dumps(evt)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+            return True
+
+        st = _ResponsesStreamState(resp_id, created, openai_model)
+
+        try:
+            gen = stream_generate_content(envelope)
+        except UpstreamError as e:
+            # Streaming rejected (e.g. 400 on tool round-trips) — fall back to
+            # non-streaming, mirroring the chat path.
+            if e.status == 400:
+                try:
+                    resp = call_generate_content(envelope)
+                    output, status = _gemini_to_responses_output(resp, openai_model)
+                    usage = _gemini_usage_to_responses_usage(resp)
+                    for evt in st.initial_events():
+                        if not send_event(evt):
+                            return
+                    for item in output:
+                        itype = item.get("type")
+                        if itype == "message":
+                            for evt in st.on_text_delta(item["content"][0]["text"]):
+                                if not send_event(evt):
+                                    return
+                        elif itype == "function_call":
+                            for evt in st.on_tool_call(0, item.get("call_id", ""), item.get("name", ""), item.get("arguments", "")):
+                                if not send_event(evt):
+                                    return
+                    for evt in st.finish("STOP" if status == "completed" else "MAX_TOKENS", usage):
+                        if not send_event(evt):
+                            return
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    pass
+            send_event({"type": "error", "code": "upstream_error", "message": str(e)})
+            return
+        except Exception as e:
+            send_event({"type": "error", "code": "upstream_error", "message": str(e)})
+            return
+
+        seen_tool_names = set()
+        usage = None
+        finish_reason = "STOP"
+        try:
+            for event in gen:
+                if not isinstance(event, dict):
+                    continue
+                resp = event.get("response", event)
+                um = resp.get("usageMetadata")
+                if um:
+                    usage = {
+                        "input_tokens": um.get("promptTokenCount", 0),
+                        "output_tokens": um.get("candidatesTokenCount", 0),
+                        "total_tokens": um.get("totalTokenCount", 0),
+                    }
+                cands = resp.get("candidates") or []
+                if not cands:
+                    continue
+                cand = cands[0]
+                parts = ((cand.get("content") or {}).get("parts")) or []
+
+                text_delta, tool_call_deltas, seen_tool_names = _extract_delta_from_parts(
+                    parts, seen_tool_names
+                )
+                fr = cand.get("finishReason")
+                if fr:
+                    finish_reason = str(fr).upper()
+
+                if text_delta:
+                    for evt in st.on_text_delta(text_delta):
+                        if not send_event(evt):
+                            return
+                for tcd in tool_call_deltas:
+                    fn = tcd.get("function") or {}
+                    for evt in st.on_tool_call(
+                        tcd.get("index", 0),
+                        tcd.get("id", ""),
+                        fn.get("name", ""),
+                        fn.get("arguments", ""),
+                    ):
+                        if not send_event(evt):
+                            return
+
+            for evt in st.finish(finish_reason, usage):
+                if not send_event(evt):
+                    return
+        except Exception as e:
+            _log(f"responses stream error: {e}\n{traceback.format_exc()}")
+            send_event({"type": "error", "code": "upstream_error", "message": str(e)})
+            return
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
     def _handle_chat(self):
         body = self._read_body()
         if body is None:
@@ -1315,6 +2109,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Allow pass-through of unknown models.
             backend_model = openai_model
             thinking_level = None
+
+        # OpenAI reasoning_effort passthrough -> daily backend tier suffix.
+        effort = body.get("reasoning_effort")
+        if effort:
+            _e = str(effort).strip().lower()
+            _tier = {"low": "low", "medium": "medium", "high": "high"}.get(_e)
+            if _tier:
+                _base = backend_model
+                for _suf in ("-low", "-medium", "-high", "-tiered"):
+                    if _base.endswith(_suf):
+                        _base = _base[: -len(_suf)]
+                        break
+                if _base.endswith("-flash"):
+                    backend_model = _base + "-" + _tier
+                    thinking_level = _tier
+        _log(f"chat model={openai_model} backend={backend_model} effort={body.get('reasoning_effort')} level={thinking_level}")
 
         # Build the Gemini request envelope.
         try:
