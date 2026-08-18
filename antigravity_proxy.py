@@ -334,6 +334,54 @@ def get_project_id() -> str:
 # OpenAI -> Gemini message transformation
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _content_to_parts(content) -> list:
+    """Build Gemini parts from OpenAI message content. Text blocks become
+    text parts; image_url data URLs become inlineData parts (real vision
+    input). Returns a list of part dicts (possibly empty)."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "text")
+            if btype == "text":
+                t = block.get("text", "")
+                if t:
+                    parts.append({"text": t})
+            elif btype == "image_url":
+                iu = block.get("image_url")
+                url = iu.get("url", "") if isinstance(iu, dict) else (iu or "")
+                if isinstance(url, str) and url.startswith("data:"):
+                    try:
+                        meta, data = url.split(",", 1)
+                        mime = meta[5:].split(";", 1)[0] or "application/octet-stream"
+                        if ";base64" in meta:
+                            parts.append({"inlineData": {"mimeType": mime, "data": data}})
+                        else:
+                            import base64
+                            parts.append({"inlineData": {"mimeType": mime,
+                                                         "data": base64.b64encode(data.encode()).decode()}})
+                    except Exception:
+                        parts.append({"text": f"[image: {url[:60]}]"})
+                elif url:
+                    parts.append({"text": f"[image: {url}]"})
+            elif btype == "input_text":
+                t = block.get("text", "")
+                if t:
+                    parts.append({"text": t})
+            elif btype == "input_image":
+                parts.append({"text": "[image provided]"})
+            else:
+                t = block.get("text")
+                if t:
+                    parts.append({"text": f"[{btype}: {str(t)[:100]}]"})
+        return parts
+    return [{"text": str(content)}] if str(content) else []
+
 def _content_to_text(content) -> str:
     """Normalize an OpenAI message 'content' field to plain text.
 
@@ -1054,11 +1102,9 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                 system_texts.append(text)
             continue
 
-        # Default: user role.
-        text = _content_to_text(msg.get("content"))
-        parts = []
-        if text:
-            parts.append({"text": text})
+        # Default: user role. Build parts from content blocks so image_url
+        # data URLs become real inlineData parts instead of text markers.
+        parts = _content_to_parts(msg.get("content"))
         # Some clients send tool_calls on user messages; handle gracefully.
         for tc in (msg.get("tool_calls") or []):
             if not isinstance(tc, dict):
@@ -1114,10 +1160,9 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         gen_config["maxOutputTokens"] = int(body["max_tokens"])
     elif "max_completion_tokens" in body and body["max_completion_tokens"] is not None:
         gen_config["maxOutputTokens"] = int(body["max_completion_tokens"])
-    if "presence_penalty" in body and body["presence_penalty"] is not None:
-        gen_config["presencePenalty"] = float(body["presence_penalty"])
-    if "frequency_penalty" in body and body["frequency_penalty"] is not None:
-        gen_config["frequencyPenalty"] = float(body["frequency_penalty"])
+    # NOTE: frequency_penalty / presence_penalty are intentionally dropped.
+    # Gemini's sandbox backend rejects them with 400 "Penalty is not enabled
+    # for this model"; OpenAI clients send them by default on some paths.
     if "stop" in body and body["stop"]:
         stops = body["stop"]
         if isinstance(stops, str):
@@ -1130,6 +1175,21 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         thinking_cfg = gen_config.get("thinkingConfig", {})
         thinking_cfg.setdefault("includeThoughts", False)
         gen_config["thinkingConfig"] = thinking_cfg
+    # OpenAI response_format -> Gemini responseMimeType / responseSchema.
+    rf = body.get("response_format") or {}
+    if isinstance(rf, dict):
+        rft = rf.get("type")
+        if rft == "json_object":
+            gen_config["responseMimeType"] = "application/json"
+        elif rft == "json_schema":
+            sch = rf.get("json_schema") or {}
+            # OpenAI wraps as {name, strict, schema:{...}}; Gemini wants the
+            # schema object directly as responseSchema.
+            if isinstance(sch, dict) and isinstance(sch.get("schema"), dict):
+                sch = sch["schema"]
+            if isinstance(sch, dict):
+                gen_config["responseMimeType"] = "application/json"
+                gen_config["responseSchema"] = _sanitize_gemini_schema(sch)
     # Inject thinking level for Gemini 3 Pro models.
     if thinking_level:
         thinking_cfg = gen_config.get("thinkingConfig", {})
