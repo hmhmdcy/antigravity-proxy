@@ -16,3 +16,6 @@ build/
 # VPS customization backups
 *.bak*
 *.bak-*
+
+# split package cache
+agp/__pycache__/
