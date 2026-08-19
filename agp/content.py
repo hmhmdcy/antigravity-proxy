@@ -13,6 +13,15 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+# Content block types that carry a model's thinking chain (reasoning).
+# They must NOT be forwarded to the upstream as context: the client is
+# showing them as a thinking block, and feeding them back would inject
+# the chain into the conversation context.
+_THINKING_BLOCK_TYPES = {
+    "reasoning", "reasoning_text", "thinking", "summary_text",
+    "output_reasoning", "reasoning_summary", "thought",
+}
+
 def _content_to_parts(content) -> list:
     """Build Gemini parts from OpenAI message content. Text blocks become
     text parts; image_url data URLs become inlineData parts (real vision
@@ -27,6 +36,10 @@ def _content_to_parts(content) -> list:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type", "text")
+            if btype in _THINKING_BLOCK_TYPES:
+                # Thinking/reasoning blocks are display-only; drop them so the
+                # chain never becomes part of the upstream conversation.
+                continue
             if btype == "text":
                 t = block.get("text", "")
                 if t:
@@ -79,6 +92,10 @@ def _content_to_text(content) -> str:
                 chunks.append(str(block))
                 continue
             btype = block.get("type", "text")
+            if btype in _THINKING_BLOCK_TYPES:
+                # Thinking/reasoning blocks are display-only; never feed the
+                # chain back to the upstream as conversation context.
+                continue
             if btype == "text":
                 chunks.append(block.get("text", ""))
             elif btype == "image_url":
