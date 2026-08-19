@@ -22,7 +22,8 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 from agp.auth import _read_token_from_disk, get_project_id
-from agp.constants import DEFAULT_MODEL, MODEL_MAP, TOKEN_FILE, _GEMINI_PASSTHROUGH_RE, _GEMINI_STREAM_PASSTHROUGH_RE
+from agp.constants import DEFAULT_MODEL, TOKEN_FILE, _GEMINI_PASSTHROUGH_RE, _GEMINI_STREAM_PASSTHROUGH_RE
+from agp.models import get_merged_model_map
 from agp.errors import _openai_error, _stream_error_payload
 from agp.log import _log
 from agp.request import _build_gemini_request, _build_passthrough_envelope, _responses_input_to_messages, _responses_tools_to_chat_tools
@@ -60,7 +61,12 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     server.daemon_threads = True
     _log(f"Antigravity proxy listening on http://{args.host}:{args.port}/v1")
-    _log(f"  Models: {', '.join(MODEL_MAP.keys())}")
+    try:
+        merged, added, err = get_merged_model_map()
+        _log("  Models: {} ({} discovered from upstream){}".format(len(merged), added, "" if not err else ", discovery failed: "+str(err)))
+        _log("  Model list: " + ", ".join(sorted(merged.keys())))
+    except Exception as e:
+        _log("  Models: {} (static; discovery error: {})".format(len(MODEL_MAP), e))
     _log(f"  Token:  {TOKEN_FILE}")
     _log(f"  Press Ctrl+C to stop")
 
@@ -159,8 +165,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_models(self):
         now = int(time.time())
+        merged, _, _ = get_merged_model_map()
         models = []
-        for name in MODEL_MAP:
+        for name in merged:
             models.append({
                 "id": name,
                 "object": "model",
@@ -317,7 +324,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         openai_model = body.get("model") or DEFAULT_MODEL
         stream = bool(body.get("stream", False))
 
-        model_entry = MODEL_MAP.get(openai_model)
+        merged, _, _ = get_merged_model_map()
+
+        model_entry = merged.get(openai_model)
         if model_entry:
             backend_model, thinking_level = model_entry
         else:
@@ -527,8 +536,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         openai_model = body.get("model") or DEFAULT_MODEL
         stream = bool(body.get("stream", False))
 
+        merged, _, _ = get_merged_model_map()
+
         # Map model. MODEL_MAP values are (backend_name, thinking_level) tuples.
-        model_entry = MODEL_MAP.get(openai_model)
+        model_entry = merged.get(openai_model)
         if model_entry:
             backend_model, thinking_level = model_entry
         else:

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+import urllib.request
 from urllib.error import HTTPError, URLError
 
 from agp.auth import get_access_token
@@ -30,6 +31,31 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
         req.add_header("Accept", "text/event-stream")
     return req
 
+
+def _opener(streaming: bool = False):
+    """Build a urlopen-compatible opener, routing through UPSTREAM_PROXY if set.
+
+    The VPS runs a Cloudflare WARP relay (172.19.0.1:17891) to give upstream
+    requests a Cloudflare US egress, which avoids intermittent
+    "User location is not supported" rejections from the sandbox backend.
+    Set UPSTREAM_PROXY=http://host:port to enable.
+    """
+    proxy_url = os.environ.get("UPSTREAM_PROXY", "").strip()
+    if not proxy_url:
+        return None
+    handlers = [urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})]
+    if streaming:
+        handlers.append(urllib.request.HTTPHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _open_url(req, timeout):
+    """Open req via the proxy opener when configured, else plain urlopen."""
+    opener = _opener()
+    if opener is not None:
+        return opener.open(req, timeout=timeout)
+    return urlopen(req, timeout=timeout)
+
 def _is_location_error(e) -> bool:
     body = getattr(e, "body", "") or ""
     return "location is not supported" in body.lower()
@@ -43,7 +69,7 @@ def call_generate_content(envelope: dict) -> dict:
     for attempt in range(_LOCATION_RETRIES + 1):
         req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
         try:
-            with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
+            with _open_url(req, UPSTREAM_TIMEOUT) as resp:
                 raw = resp.read().decode()
         except HTTPError as e:
             detail = ""
@@ -75,7 +101,7 @@ def _stream_once(envelope: dict):
     """Single streaming attempt; yields parsed SSE event objects."""
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
-        resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        resp = _open_url(req, UPSTREAM_TIMEOUT)
     except HTTPError as e:
         detail = ""
         try:

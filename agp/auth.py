@@ -72,6 +72,25 @@ def _write_token_to_disk(data: dict):
     except OSError as e:
         _log(f"WARNING: could not write token file: {e}")
 
+def _auth_opener():
+    """Open an opener routing through UPSTREAM_PROXY when configured."""
+    proxy_url = os.environ.get("UPSTREAM_PROXY", "").strip()
+    if not proxy_url:
+        return None
+    import urllib.request
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+
+
+def _auth_open_url(req, timeout):
+    import urllib.request
+    opener = _auth_opener()
+    if opener is not None:
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _refresh_access_token(refresh_token: str) -> dict:
     """Refresh the access token via Google's OAuth endpoint.
 
@@ -87,7 +106,7 @@ def _refresh_access_token(refresh_token: str) -> dict:
     req = Request(OAUTH_TOKEN_URL, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     try:
-        with urlopen(req, timeout=30) as resp:
+        with _auth_open_url(req, 30) as resp:
             payload = json.loads(resp.read().decode())
     except HTTPError as e:
         detail = ""
@@ -163,7 +182,7 @@ def _load_code_assist(access_token: str) -> str:
     req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
     req.add_header("Client-Metadata", CLIENT_METADATA)
     try:
-        with urlopen(req, timeout=60) as resp:
+        with _auth_open_url(req, 60) as resp:
             payload = json.loads(resp.read().decode())
     except HTTPError as e:
         detail = ""

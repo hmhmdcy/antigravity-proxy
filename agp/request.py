@@ -420,11 +420,20 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         thinking_cfg.setdefault("includeThoughts", True)
         gen_config["thinkingConfig"] = thinking_cfg
     # OpenAI response_format -> Gemini responseMimeType / responseSchema.
+    # NOTE: when structured output is requested, disable thinking: the
+    # sandbox ignores responseSchema under a thinking tier and returns
+    # prose + thought chain instead of strict JSON (verified 2026-08).
     rf = body.get("response_format") or {}
     if isinstance(rf, dict):
         rft = rf.get("type")
-        if rft == "json_object":
+        if rft in ("json_object", "json_schema"):
             gen_config["responseMimeType"] = "application/json"
+            # suppress thinking for structured output
+            thinking_cfg = gen_config.get("thinkingConfig", {})
+            thinking_cfg["includeThoughts"] = False
+            gen_config["thinkingConfig"] = thinking_cfg
+        if rft == "json_object":
+            pass
         elif rft == "json_schema":
             sch = rf.get("json_schema") or {}
             # OpenAI wraps as {name, strict, schema:{...}}; Gemini wants the

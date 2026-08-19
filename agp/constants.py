@@ -28,6 +28,7 @@ OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 CLOUDCODE_BASE = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
+FETCH_MODELS_URL = f"{CLOUDCODE_BASE}/v1internal:fetchAvailableModels"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 ANTIGRAVITY_USER_AGENT = "antigravity/2.8.1 windows/amd64"
 CLIENT_METADATA = json.dumps(
