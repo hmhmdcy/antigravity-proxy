@@ -25,7 +25,7 @@ CLIENT_SECRET = os.environ.get(
 )
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-CLOUDCODE_BASE = "https://daily-cloudcode-pa.sandbox.googleapis.com"
+CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
 FETCH_MODELS_URL = f"{CLOUDCODE_BASE}/v1internal:fetchAvailableModels"
