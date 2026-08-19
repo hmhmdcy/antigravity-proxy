@@ -32,10 +32,22 @@ def _gemini_to_responses_output(gemini_resp: dict, model: str) -> tuple[list, st
     cand = cands[0]
     parts = ((cand.get("content") or {}).get("parts")) or []
 
-    text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+    text_parts = [p.get("text", "") for p in parts
+                  if isinstance(p, dict) and p.get("text") and not p.get("thought")]
+    thought_parts = [p.get("text", "") for p in parts
+                     if isinstance(p, dict) and p.get("text") and p.get("thought")]
     text = "".join(text_parts)
+    thought = "".join(thought_parts)
 
     fcalls = [p.get("functionCall") for p in parts if isinstance(p, dict) and p.get("functionCall")]
+
+    if thought:
+        output.append({
+            "id": f"rs_{uuid.uuid4().hex[:12]}",
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": thought}],
+        })
 
     if text:
         output.append({
@@ -81,6 +93,11 @@ class _ResponsesStreamState:
         self.sent_msg_item = False
         self.sent_msg_part = False
         self.sent_text_done = False
+        self.sent_reasoning_item = False
+        self.sent_reasoning_part = False
+        self.sent_reasoning_done = False
+        self.reasoning_item_id = None
+        self.reasoning_buf = []
         self.msg_item_id = None
         self.text_buf = []
         self.tool_items = {}  # index -> item id
@@ -198,9 +215,67 @@ class _ResponsesStreamState:
             })
         return evts
 
+    def on_thought_delta(self, text: str) -> list:
+        """Emit Responses reasoning summary events for a thought
+        delta. Follows the Responses spec:
+        response.reasoning_summary_part.added ->
+        response.reasoning_summary_text.delta* ->
+        response.reasoning_summary_text.done.
+        """
+        evts = self.initial_events()
+        if not self.sent_reasoning_item:
+            self.sent_reasoning_item = True
+            self.reasoning_item_id = f"rs_{uuid.uuid4().hex[:12]}"
+            evts.append({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": self.reasoning_item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            })
+        if not self.sent_reasoning_part:
+            self.sent_reasoning_part = True
+            evts.append({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": self.reasoning_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            })
+        self.reasoning_buf.append(text)
+        evts.append({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": self.reasoning_item_id,
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": text,
+        })
+        return evts
+
     def finish(self, finish_reason: str, usage: dict) -> list:
         evts = self.initial_events()
         # Close message item if we opened one.
+        if self.sent_reasoning_item and not self.sent_reasoning_done:
+            self.sent_reasoning_done = True
+            evts.append({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.reasoning_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+            })
+            evts.append({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": self.reasoning_item_id,
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "".join(self.reasoning_buf)}],
+                },
+            })
         if self.sent_msg_item and not self.sent_text_done:
             self.sent_text_done = True
             text = "".join(self.text_buf)
@@ -288,8 +363,8 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"]:
-            text_chunks.append(part["text"]) and not part.get("thought")
+        if "text" in part and part["text"] and not part.get("thought") and not part.get("thoughtSignature"):
+            text_chunks.append(part["text"])
         if "functionCall" in part:
             fc = part["functionCall"] or {}
             name = fc.get("name", "")
@@ -303,12 +378,12 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
                 # Format: call_<fc_id>|<thought_signature>
                 encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else ""
                 tool_calls.append({
-                    "id": encoded_id,  # may be empty; caller assigns if so
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
-                    },
+                "id": encoded_id,  # may be empty; caller assigns if so
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
+                },
                 })
         if "executableCode" in part:
             ec = part["executableCode"] or {}
@@ -322,12 +397,14 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
                 text_chunks.append(f"```\n{out}\n```")
         if "thought" in part and part["thought"]:
             # Thinking summary part ({"thought": true, "text": ...}).
-            # Keep it separate so callers can surface it as
-            # reasoning_content.
             thought_text = part.get("text") or ""
             if thought_text:
                 thought_chunks.append(thought_text)
-
+        elif "thoughtSignature" in part and "functionCall" not in part:
+            # Gemini may mark thinking with thoughtSignature
+            thought_text = part.get("text") or ""
+            if thought_text:
+                thought_chunks.append(thought_text)
     if tool_calls:
         finish_hint = "tool_calls"
     return "".join(text_chunks), tool_calls, finish_hint, "\n".join(thought_chunks)
@@ -433,9 +510,14 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"] and not part.get("thought"):
+        if "text" in part and part["text"] and not part.get("thought") and not part.get("thoughtSignature"):
             text_chunks.append(part["text"])
         if "thought" in part and part["thought"]:
+            t = part.get("text") or ""
+            if t:
+                thought_chunks.append(t)
+        elif "thoughtSignature" in part and "functionCall" not in part:
+            # Gemini streams thinking as {text, thoughtSignature} parts
             t = part.get("text") or ""
             if t:
                 thought_chunks.append(t)

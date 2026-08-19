@@ -496,6 +496,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if fr:
                     finish_reason = str(fr).upper()
 
+                if thought_delta:
+                    for evt in st.on_thought_delta(thought_delta):
+                        if not send_event(evt):
+                            return
                 if text_delta:
                     for evt in st.on_text_delta(text_delta):
                         if not send_event(evt):
