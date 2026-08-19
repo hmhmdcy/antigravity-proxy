@@ -555,7 +555,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         effort = body.get("reasoning_effort")
         if effort:
             _e = str(effort).strip().lower()
-            _tier = {"low": "low", "medium": "medium", "high": "high"}.get(_e)
+            _tier = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}.get(_e)
             if _tier:
                 _base = backend_model
                 for _suf in ("-low", "-medium", "-high", "-tiered"):
